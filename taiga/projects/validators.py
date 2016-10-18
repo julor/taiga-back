@@ -24,7 +24,8 @@ from taiga.base.api import validators
 from taiga.base.exceptions import ValidationError
 from taiga.base.fields import JsonField
 from taiga.base.fields import PgArrayField
-from taiga.users.models import Role
+from taiga.users.models import User, Role
+from taiga.users import filters as user_filters
 
 from .tagging.fields import TagsField
 
@@ -112,21 +113,16 @@ class IssueTypeValidator(DuplicatedNameInProjectValidator, validators.ModelValid
 ######################################################
 
 class MembershipValidator(validators.ModelValidator):
-    email = serializers.EmailField(required=True)
+    email = serializers.EmailField(required=False)
+    user = serializers.PrimaryKeyRelatedField(required=False)
 
     class Meta:
         model = models.Membership
-        # IMPORTANT: Maintain the MembershipAdminSerializer Meta up to date
-        # with this info (excluding here user_email and email)
-        read_only_fields = ("user",)
-        exclude = ("token", "email")
 
-    def validate_email(self, attrs, source):
-        project = attrs.get("project", None)
+    def _validate_member_doesnt_exist(self, attrs, email):
+        project = attrs.get("project", None if self.object is None else self.object.project)
         if project is None:
-            project = self.object.project
-
-        email = attrs[source]
+            return attrs
 
         qs = models.Membership.objects.all()
 
@@ -139,14 +135,37 @@ class MembershipValidator(validators.ModelValidator):
                        Q(project_id=project.id, email=email))
 
         if qs.count() > 0:
-            raise ValidationError(_("Email address is already taken"))
+            raise ValidationError(_("The user yet exists in the project"))
+
+    def validate_email(self, attrs, source):
+        email = attrs.get(source, None)
+        if not email:
+            return attrs
+
+        self._validate_member_doesnt_exist(attrs, email)
+
+        return attrs
+
+    def validate_user(self, attrs, source):
+        user = attrs.get(source, None)
+        if not user:
+            return attrs
+
+        # If the validation comes from a request let's check the user is a valid contact
+        request = self.context.get("request", None)
+        if request is not None and request.user.is_authenticated():
+            valid_user_ids = request.user.contacts_visible_by_user(request.user).values_list("id", flat=True)
+            if user.id not in valid_user_ids:
+                raise ValidationError(_("The user must be a valid contact"))
+
+        self._validate_member_doesnt_exist(attrs, user.email)
 
         return attrs
 
     def validate_role(self, attrs, source):
-        project = attrs.get("project", None)
+        project = attrs.get("project", None if self.object is None else self.object.project)
         if project is None:
-            project = self.object.project
+            return attrs
 
         role = attrs[source]
 
@@ -156,9 +175,9 @@ class MembershipValidator(validators.ModelValidator):
         return attrs
 
     def validate_is_admin(self, attrs, source):
-        project = attrs.get("project", None)
+        project = attrs.get("project", None if self.object is None else self.object.project)
         if project is None:
-            project = self.object.project
+            return attrs
 
         if (self.object and self.object.user):
             if self.object.user.id == project.owner_id and not attrs[source]:
@@ -171,19 +190,35 @@ class MembershipValidator(validators.ModelValidator):
 
         return attrs
 
+    def validate(self, data):
+        user = data.get("user", None)
+        email = data.get("email", None)
+
+        # On creating user or email must be included
+        if self.object is None and user is None and email is None:
+            raise ValidationError(_("Email or user must be set"))
+
+        return data
 
 class MembershipAdminValidator(MembershipValidator):
     class Meta:
         model = models.Membership
-        # IMPORTANT: Maintain the MembershipSerializer Meta up to date
-        # with this info (excluding there user_email and email)
-        read_only_fields = ("user",)
-        exclude = ("token",)
 
 
 class _MemberBulkValidator(validators.Validator):
-    email = serializers.EmailField()
+    email = serializers.EmailField(required=False)
+    user_id = serializers.IntegerField(required=False)
     role_id = serializers.IntegerField()
+
+    def validate(self, data):
+        user_id = data.get("user_id", None)
+        email = data.get("email", None)
+
+        # User or email must be included
+        if user_id is None and email is None:
+            raise ValidationError(_("Email or user_id must be set"))
+
+        return data
 
 
 class MembersBulkValidator(ProjectExistsValidator, validators.Validator):
@@ -192,13 +227,20 @@ class MembersBulkValidator(ProjectExistsValidator, validators.Validator):
     invitation_extra_text = serializers.CharField(required=False, max_length=255)
 
     def validate_bulk_memberships(self, attrs, source):
-        filters = {
-            "project__id": attrs["project_id"],
-            "id__in": [r["role_id"] for r in attrs["bulk_memberships"]]
-        }
+        project_id = attrs["project_id"]
+        role_ids = [r["role_id"] for r in attrs["bulk_memberships"]]
 
-        if Role.objects.filter(**filters).count() != len(set(filters["id__in"])):
+
+        if Role.objects.filter(project_id=project_id, id__in=role_ids).count() != len(set(role_ids)):
             raise ValidationError(_("Invalid role ids. All roles must belong to the same project."))
+
+        # If the validation comes from a request let's check the user is a valid contact
+        request = self.context.get("request", None)
+        if request is not None and request.user.is_authenticated():
+            user_ids = set(filter(None, [r.get("user_id", None) for r in attrs["bulk_memberships"]]))
+            valid_user_ids = set(request.user.contacts_visible_by_user(request.user).values_list("id", flat=True))
+            if not user_ids.issubset(valid_user_ids):
+                raise ValidationError(_("The user must be a valid contact"))
 
         return attrs
 

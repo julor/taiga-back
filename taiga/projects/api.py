@@ -700,7 +700,10 @@ class MembershipViewSet(BlockedByProjectMixin, ModelCrudViewSet):
 
     @list_route(methods=["POST"])
     def bulk_create(self, request, **kwargs):
-        validator = validators.MembersBulkValidator(data=request.DATA)
+        context = {
+            "request": request
+        }
+        validator = validators.MembersBulkValidator(data=request.DATA, context=context)
         if not validator.is_valid():
             return response.BadRequest(validator.errors)
 
